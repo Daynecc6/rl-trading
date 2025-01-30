@@ -1,264 +1,190 @@
-import matplotlib.pyplot as plt
-import torch
-import os
-import logging
-from trading_env import TradingEnv
-from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
-from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
-from stable_baselines3.common.utils import set_random_seed
-from stable_baselines3.common.evaluation import evaluate_policy
-from stable_baselines3.common.monitor import Monitor
-import pandas as pd
-import yfinance as yf
-from hmmlearn.hmm import GaussianHMM
-from sklearn.preprocessing import StandardScaler
 import numpy as np
-from datetime import datetime
-import ta
-import os
-import warnings
+import matplotlib.pyplot as plt
+import optuna
 
-# Disable TensorFlow logs
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow INFO, WARNING, and ERROR logs
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Disable oneDNN custom ops
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv
 
-# Suppress Gym warnings
-warnings.filterwarnings("ignore", category=UserWarning, module='gym')
+from env import RealisticPortfolioEnv
+from utils import fetch_data, split_data
 
 
+def main():
+    # 1) Fetch data
+    assets = ['AAPL', 'TSLA', 'SPY', 'QQQ']
+    data, returns_df = fetch_data(assets, start="2015-01-01", end="2023-12-31")
 
-class TradingCallback(BaseCallback):
-    def __init__(self, eval_env, verbose=1):
-        super().__init__(verbose)
-        self.eval_env = eval_env
-        self.best_reward = -np.inf
-        self.evaluation_interval = 10000
-        
-        
-    def _on_step(self):
-        if self.n_calls % self.evaluation_interval == 0:
-            mean_reward = self._evaluate_agent()
-            if mean_reward > self.best_reward:
-                self.best_reward = mean_reward
-                self.model.save(f"best_model_{mean_reward:.0f}")
-        return True
+    # 2) Split train/test
+    train_df, test_df = split_data(returns_df, train_end="2020-12-31")
+    train_returns = train_df.to_numpy(dtype=np.float32)
+    test_returns  = test_df.to_numpy(dtype=np.float32)
 
-    def _evaluate_agent(self):
-        mean_reward, _ = evaluate_policy(self.model, self.eval_env, n_eval_episodes=5)
-        self.logger.record('eval/mean_reward', mean_reward)
-        return mean_reward
+    print(f"Train range: {train_df.index[0]} to {train_df.index[-1]} (days={len(train_df)})")
+    print(f"Test  range: {test_df.index[0]} to {test_df.index[-1]} (days={len(test_df)})")
 
-def prepare_data(symbol='AAPL', start='2015-01-01', end='2023-12-31'):
-    try:
-        data = pd.read_csv(f'{symbol}_data.csv', index_col=0, parse_dates=True)
-        print(f"Loaded {symbol} data from local CSV.")
-    except FileNotFoundError:
-        data = yf.download(symbol, start=start, end=end)
-        data.to_csv(f'{symbol}_data.csv')
-        print(f"Downloaded {symbol} data and saved to local CSV.")
-    
-    # Ensure all required columns exist
-    required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
-    data = data[required_columns]
-    
-    # Add technical indicators
-    data = add_technical_indicators(data)
-    
-    # Calculate returns and volatility
-    data['Returns'] = data['Close'].pct_change()
-    data['Volatility'] = data['Returns'].rolling(window=20).std() * np.sqrt(252)  # Annualized volatility
-    
-    # Fit HMM
-    hmm_features = data[['Returns']].dropna().values
-    n_components = 4
-    hmm_model = GaussianHMM(n_components=n_components, covariance_type="full", n_iter=1000, random_state=42)
-    hmm_model.fit(hmm_features)
-    
-    # Get state probabilities
-    state_probs = hmm_model.predict_proba(hmm_features)
-    state_probs_df = pd.DataFrame(state_probs, columns=[f'State_{i}' for i in range(n_components)], index=data.index[1:])
-    data = pd.concat([data, state_probs_df], axis=1)
-    
-    # Normalize data
-    scaler = StandardScaler()
-    cols_to_scale = data.columns.drop(['Volume', 'Returns'] + [f'State_{i}' for i in range(n_components)])
-    data[cols_to_scale] = scaler.fit_transform(data[cols_to_scale])
-    
-    # Handle inf and NaN values
-    data.replace([np.inf, -np.inf], np.nan, inplace=True)
-    data = data.ffill().bfill()  # Forward fill then backward fill
-    
-    return data
+    def objective(trial: optuna.Trial):
+        """
+        Optuna objective: build a PPO with trial-suggested hyperparams,
+        train briefly, then measure Sharpe on test set.
+        """
+        learning_rate = trial.suggest_float("learning_rate", 1e-5, 5e-4, log=True)
+        ent_coef      = trial.suggest_float("ent_coef", 0.0, 0.05)
+        n_steps       = trial.suggest_categorical("n_steps", [1024, 2048])
+        batch_size    = trial.suggest_categorical("batch_size", [128, 256, 512])
 
-def add_technical_indicators(data):
-    # Basic indicators
-    data['MA14'] = ta.trend.sma_indicator(data['Close'], window=14)
-    data['RSI14'] = ta.momentum.rsi(data['Close'], window=14)
-    bb_indicator = ta.volatility.BollingerBands(data['Close'], window=14)
-    data['BB_upper'] = bb_indicator.bollinger_hband()
-    data['BB_lower'] = bb_indicator.bollinger_lband()
-    macd = ta.trend.MACD(data['Close'])
-    data['MACD'] = macd.macd()
-    data['MACD_signal'] = macd.macd_signal()
-    data['ATR'] = ta.volatility.average_true_range(data['High'], data['Low'], data['Close'])
-    data['OBV'] = ta.volume.on_balance_volume(data['Close'], data['Volume'])
-    
-    # Additional indicators from trading_env.py
-    data['BB_width'] = (data['BB_upper'] - data['BB_lower']) / data['MA14']
-    data['ROC'] = data['Close'].pct_change(10)
-    data['MACD_hist'] = data['MACD'] - data['MACD_signal']
-    
-    # Money Flow Index
-    typical_price = (data['High'] + data['Low'] + data['Close']) / 3
-    money_flow = typical_price * data['Volume']
-    positive_flow = money_flow.where(typical_price > typical_price.shift(1), 0).rolling(14).sum()
-    negative_flow = money_flow.where(typical_price < typical_price.shift(1), 0).rolling(14).sum()
-    data['MFI'] = 100 - (100 / (1 + positive_flow / negative_flow))
-    
-    # ADX (Average Directional Index)
-    data['ADX'] = ta.trend.adx(data['High'], data['Low'], data['Close'])
-    
-    # Ichimoku Cloud
-    ichimoku = ta.trend.IchimokuIndicator(data['High'], data['Low'])
-    data['Ichimoku_Base'] = ichimoku.ichimoku_base_line()
-    
-    return data
+        # Create environment
+        def make_env():
+            env = RealisticPortfolioEnv(
+                returns=train_returns,
+                window_size=20,
+                max_position=0.3,
+                target_vol=0.15,
+                base_cost=0.0005,
+                impact_cost=0.0002
+            )
+            return env
 
-def make_env(data, lookback_window, rank):
-    def _init():
-        env = TradingEnv(data, lookback_window)
-        return env  # No need to wrap with Monitor unless you're logging
-    set_random_seed(42 + rank)
-    return _init
+        # Single environment in a DummyVecEnv
+        env = DummyVecEnv([make_env])
 
+        # PPO with these hyperparams
+        model = PPO(
+            "MlpPolicy",
+            env,
+            device="cuda",
+            verbose=0,
+            n_steps=n_steps,
+            batch_size=batch_size,
+            ent_coef=ent_coef,
+            learning_rate=learning_rate,
+            policy_kwargs=dict(net_arch=[dict(pi=[128, 128], vf=[128, 128])]),
+        )
 
-if __name__ == "__main__":
-    # Set up logging
-    logging.basicConfig(level=logging.INFO)
-    
-    # Prepare data
-    data = prepare_data(symbol='AAPL', start='2015-01-01', end='2023-12-31')
-    print(f"Data shape: {data.shape}")
-    print(f"Number of features: {len(data.columns)}")
-    
-    # Split data into train and test sets
-    train_data = data.iloc[:int(len(data)*0.8)]
-    test_data = data.iloc[int(len(data)*0.8):]
-    
-    # Create parallel environments
-    n_envs = 8
-    lookback_window = 20
-    env_fns = [make_env(train_data, lookback_window=lookback_window, rank=i) for i in range(n_envs)]
-    train_env = SubprocVecEnv(env_fns)
-    # train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=10.)
-    
-    # Create test environment
-    test_env = SubprocVecEnv([make_env(test_data, lookback_window=lookback_window, rank=0)])
-    test_env = VecNormalize(test_env, norm_obs=True, norm_reward=True, clip_obs=10.)
-    
-    # Initialize model with custom policy
-    import torch
+        # Train for fewer timesteps to keep tuning quick
+        model.learn(total_timesteps=200_000)
 
-    policy_kwargs = dict(
-    net_arch=[128, 128],  # List of hidden layer sizes
-    activation_fn=torch.nn.ReLU,
-    )
-    
+        # Evaluate on test set
+        final_val, daily_returns, _ = test_single_pass(model, test_returns)
+        sharpe = compute_sharpe(daily_returns)
+
+        env.close()
+        return sharpe
+
+    # 3) Run hyperparam search
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=3)
+    print("\n=== Hyperparam Search Complete ===")
+    print("Best value (Sharpe):", study.best_value)
+    print("Best params:", study.best_params)
+
+    # 4) Now final training with best hyperparams
+    best_params = study.best_params
+    final_env = DummyVecEnv([lambda: RealisticPortfolioEnv(
+        returns=train_returns,
+        window_size=20,
+        max_position=0.3,
+        target_vol=0.15,
+        base_cost=0.0005,
+        impact_cost=0.0002
+    )])
     model = PPO(
         "MlpPolicy",
-        train_env,
+        final_env,
+        device="cuda",
         verbose=1,
-        tensorboard_log="./ppo_trading_tensorboard/",
-        learning_rate=3e-4,
-        n_steps=2048,
-        batch_size=64 * n_envs,
-        n_epochs=10,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        clip_range_vf=None,
-        ent_coef=0.01,
-        vf_coef=0.5,
-        max_grad_norm=0.5,
-        use_sde=False,
-        sde_sample_freq=-1,
-        target_kl=None,
-        policy_kwargs=policy_kwargs
+        n_steps=best_params["n_steps"],
+        batch_size=best_params["batch_size"],
+        ent_coef=best_params["ent_coef"],
+        learning_rate=best_params["learning_rate"],
+        policy_kwargs=dict(net_arch=[dict(pi=[128, 128], vf=[128, 128])]),
+        tensorboard_log="./tensorboard_logs/",
     )
+    model.learn(total_timesteps=500_000)
+    final_env.close()
 
-    
-    # Set up callbacks
-    eval_callback = EvalCallback(test_env, best_model_save_path='./logs/',
-                                 log_path='./logs/', eval_freq=10000,
-                                 deterministic=True, render=False)
-    
-    # Train the model
-    try:
-        model.learn(
-            total_timesteps=1000000,
-            callback=[eval_callback],
-            progress_bar=True
-        )
-        print("Training complete.")
-        
-        # Save the final model
-        model.save("final_trading_model")
-        
-    except Exception as e:
-        print(f"Error during training: {e}")
-        raise
-    
-    # Evaluate the model
-    mean_reward, std_reward = evaluate_policy(model, test_env, n_eval_episodes=10)
-    print(f"Mean reward: {mean_reward:.2f} +/- {std_reward:.2f}")
-    
-    # Test the model
-    obs = test_env.reset()
-    done = [False]
-    total_reward = 0
-    actions = []
-    rewards = []
-    
-    while not done[0]:
-        action, _states = model.predict(obs, deterministic=True)
-        obs, reward, done, info = test_env.step(action)
-        total_reward += reward[0]
-        actions.append(action[0])
-        rewards.append(reward[0])
-    
-    print(f"Total reward: {total_reward}")
-    
-    # Convert actions and rewards to numpy arrays for easier plotting
-    actions = np.array(actions)
-    rewards = np.array(rewards)
-    
-    # Plot results
-    plt.figure(figsize=(15, 10))
-    
-    plt.subplot(3, 1, 1)
-    plt.plot(actions[:, 0], label='Position Size')
-    plt.title('Actions - Position Size')
+    # 5) Final test
+    final_value, daily_returns, values_series = test_single_pass(model, test_returns)
+    plt.plot(values_series, label="RL (PPO) OOS Value")
+    plt.title("Out-of-Sample Portfolio Value")
+    plt.xlabel("Test Days")
+    plt.ylabel("Value")
     plt.legend()
-    
-    plt.subplot(3, 1, 2)
-    plt.plot(actions[:, 1], label='Stop Loss')
-    plt.plot(actions[:, 2], label='Take Profit')
-    plt.title('Actions - Stop Loss and Take Profit')
-    plt.legend()
-    
-    plt.subplot(3, 1, 3)
-    plt.plot(rewards, label='Rewards')
-    plt.title('Rewards')
-    plt.legend()
-    
-    plt.tight_layout()
-    plt.savefig('trading_results.png')
     plt.show()
 
-    # Print some statistics
-    print(f"Number of trades: {len(actions)}")
-    print(f"Average position size: {np.mean(actions[:, 0]):.4f}")
-    print(f"Average stop loss: {np.mean(actions[:, 1]):.4f}")
-    print(f"Average take profit: {np.mean(actions[:, 2]):.4f}")
-    print(f"Total cumulative reward: {np.sum(rewards):.4f}")
+    sharpe = compute_sharpe(daily_returns)
+    print(f"Final Value: {final_value:,.2f}")
+    print(f"Avg Daily Return: {100*np.mean(daily_returns):.3f}%")
+    print(f"Sharpe Ratio: {sharpe:.3f}")
+
+
+def compute_sharpe(daily_returns):
+    avg_r = np.mean(daily_returns)
+    std_r = np.std(daily_returns) + 1e-8
+    return avg_r / std_r
+
+
+def test_single_pass(model, test_returns, window_size=20, max_position=0.3,
+                     target_vol=0.15, base_cost=0.0005, impact_cost=0.0002):
+    """
+    Single run from day=window_size to end of test_returns.
+    Similar to your existing approach.
+    """
+    initial_capital = 1_000_000
+    n_assets = test_returns.shape[1]
+    portfolio_value = initial_capital
+    portfolio_weights = np.zeros(n_assets, dtype=np.float32)
+    daily_rets_list = []
+    values_series = [portfolio_value]
+
+    current_step = window_size
+
+    def get_obs(step):
+        slice_returns = test_returns[step - window_size: step]
+        realized_vol = np.array([
+            np.std(slice_returns[max(0, i-5):i], axis=0)
+            for i in range(1, window_size+1)
+        ])
+        obs = np.concatenate([slice_returns.flatten(), realized_vol.flatten()])
+        return obs.astype(np.float32)
+
+    obs = get_obs(current_step)
+
+    while current_step < len(test_returns) - 1:
+        action, _ = model.predict(obs, deterministic=True)
+
+        # sum(weights)<=1
+        action = np.clip(action, 0, 1)
+        sum_a = np.sum(action)
+        if sum_a > 1.0:
+            action *= (1.0 / sum_a)
+        action = np.minimum(action, max_position)
+
+        daily_ret_vec = test_returns[current_step]
+        hist_returns = test_returns[current_step - window_size : current_step]
+        realized_vol_assets = np.std(hist_returns, axis=0) + 1e-8
+        annualized_vol_assets = realized_vol_assets * np.sqrt(252)
+        scale_factors = target_vol / annualized_vol_assets
+
+        portfolio_return_raw = float(np.dot(daily_ret_vec * scale_factors, action))
+
+        trade_size = np.sum(np.abs(portfolio_weights - action))
+        tcost = base_cost * trade_size + impact_cost * (trade_size**2)
+
+        day_ret = portfolio_return_raw - tcost
+
+        portfolio_value *= (1.0 + day_ret)
+        daily_rets_list.append(day_ret)
+        values_series.append(portfolio_value)
+
+        portfolio_weights = action
+
+        current_step += 1
+        if current_step >= len(test_returns):
+            break
+        obs = get_obs(current_step)
+
+    return portfolio_value, daily_rets_list, values_series
+
+
+if __name__ == "__main__"w:
+    main()
